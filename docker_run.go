@@ -10,6 +10,9 @@ import (
 )
 
 func main() {
+        // Check Docker running
+        checkDockerAvailable()
+
 	// Validate arguments
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: docker_run [ build | server | generate_toml | update_scripts | update_fdevsec | shell ]")
