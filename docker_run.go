@@ -1,71 +1,51 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/client"
+	"github.com/docker/go-connections/nat"
+	"github.com/spf13/cobra"
 )
 
-func main() {
-        // Check Docker running
-        checkDockerAvailable()
+// Config holds configurable parameters.
+type Config struct {
+	DockerImage   string
+	HostPort      string // e.g. "1313"
+	ContainerPort string // e.g. "1313"
+}
 
-	// Validate arguments
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: docker_run [ build | server | generate_toml | update_scripts | update_fdevsec | shell ]")
-		os.Exit(1)
+// getConfig reads configuration from environment variables (with defaults).
+func getConfig() Config {
+	dockerImage := os.Getenv("DOCKER_IMAGE")
+	if dockerImage == "" {
+		dockerImage = "fortinet-hugo:latest"
 	}
-	command := os.Args[1]
-
-	// Get current directory and adjust paths
-	currentDir, err := filepath.Abs(".")
-	if err != nil {
-		fmt.Printf("Error getting current directory: %v\n", err)
-		os.Exit(1)
+	hostPort := os.Getenv("HOST_PORT")
+	if hostPort == "" {
+		hostPort = "1313"
 	}
-	userRepoPath := adjustPathForDocker(currentDir)
-	centralRepoPath := adjustPathForDocker(filepath.Join(currentDir, "hugo.toml"))
-
-	var cmdArgs []string
-	switch command {
-	case "server", "shell", "build":
-		cmdArgs = []string{
-			"run",
-			"--rm",
-			"-it",
-			"-v", fmt.Sprintf("%s:/home/UserRepo", userRepoPath),
-			"--mount", fmt.Sprintf("type=bind,source=%s,target=/home/CentralRepo/hugo.toml", centralRepoPath),
-			"-p", "1313:1313",
-			"fortinet-hugo:latest",
-			command, "--disableFastRender", "--poll",
-		}
-	case "generate_toml", "update_scripts", "update_fdevsec":
-		cmdArgs = []string{
-			"run",
-			"--rm",
-			"-it",
-			"-v", fmt.Sprintf("%s:/home/UserRepo", userRepoPath),
-			"fortinet-hugo:latest",
-			command,
-		}
-	default:
-		fmt.Println("Invalid command.")
-		os.Exit(1)
+	containerPort := os.Getenv("CONTAINER_PORT")
+	if containerPort == "" {
+		containerPort = "1313"
 	}
-
-	fmt.Println("**** Here's the docker run command we're using: ****")
-	fmt.Printf("docker %s\n", strings.Join(cmdArgs, " "))
-	err = executeDockerCommand(cmdArgs)
-	if err != nil {
-		fmt.Printf("Error executing Docker command: %v\n", err)
-		os.Exit(1)
+	return Config{
+		DockerImage:   dockerImage,
+		HostPort:      hostPort,
+		ContainerPort: containerPort,
 	}
 }
 
-// adjustPathForDocker converts paths for WSL2 or native Windows environments
+// adjustPathForDocker converts paths for WSL2 or native Windows environments.
 func adjustPathForDocker(path string) string {
 	if runtime.GOOS == "windows" {
 		// Convert Unix-like paths (/mnt/c/...) to Windows-style (C:\...)
@@ -84,26 +64,188 @@ func adjustPathForDocker(path string) string {
 	return path
 }
 
-// isWSL2 detects if the program is running inside WSL2
+// isWSL2 detects if the program is running inside WSL2.
 func isWSL2() bool {
 	_, isWSL := os.LookupEnv("WSL_INTEROP")
 	return isWSL && runtime.GOOS == "linux"
 }
 
-// executeDockerCommand runs the Docker command with the provided arguments
-func executeDockerCommand(args []string) error {
-	cmd := exec.Command("docker", args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+// runContainer uses the Docker SDK to create, start, and (if interactive) attach to a container.
+func runContainer(ctx context.Context, cli *client.Client, cfg Config, commandArgs []string, mounts []mount.Mount, portBindings nat.PortMap, interactive bool) error {
+	containerConfig := &container.Config{
+		Image:        cfg.DockerImage,
+		Cmd:          commandArgs,
+		Tty:          interactive,
+		AttachStdout: true,
+		AttachStderr: true,
+		AttachStdin:  interactive,
+		OpenStdin:    interactive,
+	}
+
+	hostConfig := &container.HostConfig{
+		Mounts:       mounts,
+		PortBindings: portBindings,
+	}
+
+	// Create the container.
+	created, err := cli.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, "")
+	if err != nil {
+		return fmt.Errorf("container create error: %w", err)
+	}
+
+	// Start the container.
+	if err := cli.ContainerStart(ctx, created.ID, types.ContainerStartOptions{}); err != nil {
+		return fmt.Errorf("container start error: %w", err)
+	}
+
+	// If interactive, attach to the container's I/O.
+	if interactive {
+		attachResp, err := cli.ContainerAttach(ctx, created.ID, types.ContainerAttachOptions{
+			Stream: true, Stdout: true, Stderr: true, Stdin: true,
+		})
+		if err != nil {
+			return fmt.Errorf("container attach error: %w", err)
+		}
+		defer attachResp.Close()
+
+		// Copy stdin to container's input.
+		go func() {
+			_, _ = io.Copy(attachResp.Conn, os.Stdin)
+		}()
+
+		// Copy container's output to stdout.
+		_, err = io.Copy(os.Stdout, attachResp.Reader)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("copy output error: %w", err)
+		}
+	} else {
+		// For non-interactive commands, stream logs.
+		logs, err := cli.ContainerLogs(ctx, created.ID, types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true, Follow: true})
+		if err != nil {
+			return fmt.Errorf("container logs error: %w", err)
+		}
+		defer logs.Close()
+		_, err = io.Copy(os.Stdout, logs)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("copy logs error: %w", err)
+		}
+	}
+
+	// Wait for the container to exit.
+	statusCh, errCh := cli.ContainerWait(ctx, created.ID, container.WaitConditionNotRunning)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return fmt.Errorf("container wait error: %w", err)
+		}
+	case <-statusCh:
+	}
+
+	return nil
 }
 
-func checkDockerAvailable() {
-  _, err := exec.LookPath("docker")
-  if err != nil {
-    fmt.Println("Docker is not installed or not found in PATH.")
-    os.Exit(1)
-  }
+// runHugoCommand builds the proper arguments, mounts, and port bindings for a given Hugo command.
+func runHugoCommand(mainCmd string) error {
+	var cmdArgs []string
+	interactive := false
+
+	switch mainCmd {
+	case "server", "shell", "build":
+		// These commands run interactively.
+		cmdArgs = []string{mainCmd, "--disableFastRender", "--poll"}
+		interactive = true
+	case "generate_toml", "update_scripts", "update_fdevsec":
+		cmdArgs = []string{mainCmd}
+	default:
+		return fmt.Errorf("unknown command: %s", mainCmd)
+	}
+
+	// Get current directory and adjust paths.
+	currentDir, err := filepath.Abs(".")
+	if err != nil {
+		return fmt.Errorf("error getting current directory: %w", err)
+	}
+	userRepoPath := adjustPathForDocker(currentDir)
+	centralRepoPath := adjustPathForDocker(filepath.Join(currentDir, "hugo.toml"))
+
+	// Prepare mount bindings.
+	var mounts []mount.Mount
+	// All commands get the user repo mounted.
+	mounts = append(mounts, mount.Mount{
+		Type:   mount.TypeBind,
+		Source: userRepoPath,
+		Target: "/home/UserRepo",
+	})
+	// For interactive commands, also bind the hugo.toml.
+	if interactive {
+		mounts = append(mounts, mount.Mount{
+			Type:   mount.TypeBind,
+			Source: centralRepoPath,
+			Target: "/home/CentralRepo/hugo.toml",
+		})
+	}
+
+	// Port bindings only for interactive commands (server, shell, build).
+	portBindings := nat.PortMap{}
+	cfg := getConfig()
+	if interactive {
+		containerPort := nat.Port(cfg.ContainerPort + "/tcp")
+		portBindings[containerPort] = []nat.PortBinding{
+			{
+				HostIP:   "0.0.0.0",
+				HostPort: cfg.HostPort,
+			},
+		}
+	}
+
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return fmt.Errorf("failed to create docker client: %w", err)
+	}
+
+	// Run the container.
+	if err := runContainer(ctx, cli, cfg, cmdArgs, mounts, portBindings, interactive); err != nil {
+		return fmt.Errorf("failed to run container: %w", err)
+	}
+	return nil
+}
+
+func main() {
+	rootCmd := &cobra.Command{
+		Use:   "docker_run",
+		Short: "Run the Hugo application inside a Docker container",
+	}
+
+	// Interactive subcommands.
+	for _, sub := range []string{"server", "shell", "build"} {
+		// Capture sub in loop.
+		subCmd := sub
+		rootCmd.AddCommand(&cobra.Command{
+			Use:   subCmd,
+			Short: fmt.Sprintf("Run Hugo %s command interactively", subCmd),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return runHugoCommand(subCmd)
+			},
+		})
+	}
+
+	// Non-interactive subcommands.
+	for _, sub := range []string{"generate_toml", "update_scripts", "update_fdevsec"} {
+		// Capture sub in loop.
+		subCmd := sub
+		rootCmd.AddCommand(&cobra.Command{
+			Use:   subCmd,
+			Short: fmt.Sprintf("Run Hugo %s command", subCmd),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return runHugoCommand(subCmd)
+			},
+		})
+	}
+
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Println("Error:", err)
+		os.Exit(1)
+	}
 }
 
