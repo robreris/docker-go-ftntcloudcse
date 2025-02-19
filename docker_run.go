@@ -12,13 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	//"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 	"github.com/fsnotify/fsnotify"
-	"github.com/spf13/cobra"
 )
 
 // Config holds configurable parameters.
@@ -60,15 +58,20 @@ func getConfig() Config {
 	}
 }
 
-// adjustPathForDocker converts paths for WSL2 or native Windows environments.
+// adjustPathForDocker converts paths for Windows/WSL2; on macOS (darwin) no change is needed.
 func adjustPathForDocker(path string) string {
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "darwin" {
+		// macOS uses Unix-style paths.
+		return path
+	} else if runtime.GOOS == "windows" {
+		// Convert Unix-like paths (/mnt/c/...) to Windows-style (C:\...)
 		if strings.HasPrefix(path, "/mnt/") {
 			path = strings.ReplaceAll(path, "/mnt/", "")
 			path = strings.ReplaceAll(path, "/", "\\")
 			path = strings.ToUpper(path[:1]) + ":" + path[1:]
 		}
 	} else if isWSL2() {
+		// Convert Windows-style paths (C:\...) to WSL-compatible paths (/mnt/c/...)
 		if len(path) > 1 && path[1] == ':' {
 			drive := strings.ToLower(string(path[0]))
 			path = fmt.Sprintf("/mnt/%s%s", drive, strings.ReplaceAll(path[2:], "\\", "/"))
@@ -82,11 +85,10 @@ func isWSL2() bool {
 	return isWSL && runtime.GOOS == "linux"
 }
 
-// startContainer creates and starts the Docker container.
-// The 'interactive' flag indicates whether we should add the Hugo config mount.
-func startContainer(ctx context.Context, cli *client.Client, cfg Config, cmd []string, interactive bool) (string, error) {
+// startContainer creates and starts the Docker container running Hugo.
+func startContainer(ctx context.Context, cli *client.Client, cfg Config) (string, error) {
+	// Adjust the path for mounting.
 	userRepoPath := adjustPathForDocker(cfg.WatchDir)
-	// Always mount the project directory.
 	mounts := []mount.Mount{
 		{
 			Type:   mount.TypeBind,
@@ -94,23 +96,23 @@ func startContainer(ctx context.Context, cli *client.Client, cfg Config, cmd []s
 			Target: "/home/UserRepo",
 		},
 	}
-	// For interactive commands, also mount the Hugo config file.
-	if interactive {
-		configPath := filepath.Join(cfg.WatchDir, "hugo.toml")
-		if _, err := os.Stat(configPath); os.IsNotExist(err) {
-			fmt.Printf("Warning: Hugo config file not found at %s. The container may exit if Hugo requires it.\n", configPath)
-		}
-		centralRepoPath := adjustPathForDocker(configPath)
-		mounts = append(mounts, mount.Mount{
-			Type:   mount.TypeBind,
-			Source: centralRepoPath,
-			Target: "/home/CentralRepo/hugo.toml",
-		})
-	}
 
+	// Mount the Hugo configuration file.
+	configPath := filepath.Join(cfg.WatchDir, "hugo.toml")
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		fmt.Printf("Warning: Hugo config file not found at %s. The container may exit if Hugo requires it.\n", configPath)
+	}
+	centralRepoPath := adjustPathForDocker(configPath)
+	mounts = append(mounts, mount.Mount{
+		Type:   mount.TypeBind,
+		Source: centralRepoPath,
+		Target: "/home/CentralRepo/hugo.toml",
+	})
+
+	// Prepare the container configuration.
 	containerConfig := &container.Config{
 		Image: cfg.DockerImage,
-		Cmd:   cmd,
+		Cmd:   []string{"server", "--bind", "0.0.0.0", "--liveReload", "--disableFastRender", "--poll"},
 		Tty:   true,
 		ExposedPorts: nat.PortSet{
 			nat.Port(cfg.ContainerPort + "/tcp"): struct{}{},
@@ -119,7 +121,7 @@ func startContainer(ctx context.Context, cli *client.Client, cfg Config, cmd []s
 	hostConfig := &container.HostConfig{
 		Mounts: mounts,
 		PortBindings: nat.PortMap{
-			nat.Port(cfg.ContainerPort + "/tcp"): []nat.PortBinding{
+			nat.Port(cfg.ContainerPort+"/tcp"): []nat.PortBinding{
 				{
 					HostIP:   "0.0.0.0",
 					HostPort: cfg.HostPort,
@@ -127,6 +129,7 @@ func startContainer(ctx context.Context, cli *client.Client, cfg Config, cmd []s
 			},
 		},
 	}
+
 	created, err := cli.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, "")
 	if err != nil {
 		return "", fmt.Errorf("container create error: %w", err)
@@ -138,40 +141,34 @@ func startContainer(ctx context.Context, cli *client.Client, cfg Config, cmd []s
 	return created.ID, nil
 }
 
-// attachContainer attaches to the container's I/O.
-func attachContainer(ctx context.Context, cli *client.Client, containerID string, interactive bool) error {
-	var attachOpts container.AttachOptions
-	if interactive {
-		attachOpts = container.AttachOptions{
-			Stream: true, Stdout: true, Stderr: true, Stdin: true,
-		}
-	} else {
-		attachOpts = container.AttachOptions{
-			Stream: true, Stdout: true, Stderr: true,
-		}
+// attachContainer attaches to the container's I/O streams.
+func attachContainer(ctx context.Context, cli *client.Client, containerID string) error {
+	opts := container.AttachOptions{
+		Stream: true,
+		Stdout: true,
+		Stderr: true,
+		Stdin:  true,
 	}
-	resp, err := cli.ContainerAttach(ctx, containerID, attachOpts)
+	resp, err := cli.ContainerAttach(ctx, containerID, opts)
 	if err != nil {
 		return fmt.Errorf("container attach error: %w", err)
 	}
-	// Stream container output to stdout.
+	// Copy container output to os.Stdout.
 	go func() {
 		_, _ = io.Copy(os.Stdout, resp.Reader)
 	}()
-	if interactive {
-		// Forward user input to the container.
-		go func() {
-			_, _ = io.Copy(resp.Conn, os.Stdin)
-		}()
-	}
+	// Forward os.Stdin to the container.
+	go func() {
+		_, _ = io.Copy(resp.Conn, os.Stdin)
+	}()
 	return nil
 }
 
 // stopAndRemoveContainer stops and removes the specified container.
 func stopAndRemoveContainer(cli *client.Client, containerID string) {
-	fmt.Println("Stopping container:", containerID)
-        timeOut := 10
-	stopOpts := container.StopOptions{Timeout: &timeOut}
+	fmt.Printf("Stopping container: %s\n", containerID)
+        timeout := 10
+	stopOpts := container.StopOptions{Timeout: &timeout}
 	if err := cli.ContainerStop(context.Background(), containerID, stopOpts); err != nil {
 		fmt.Printf("Error stopping container %s: %v\n", containerID, err)
 	}
@@ -180,7 +177,8 @@ func stopAndRemoveContainer(cli *client.Client, containerID string) {
 	}
 }
 
-func watchAndRestart(ctx context.Context, cli *client.Client, cfg Config, containerID *string, cmd []string, interactive bool) {
+// watchAndRestart monitors the watch directory (recursively) and restarts the container after a debounce interval.
+func watchAndRestart(ctx context.Context, cli *client.Client, cfg Config, containerID *string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		fmt.Printf("Error creating file watcher: %v\n", err)
@@ -188,25 +186,20 @@ func watchAndRestart(ctx context.Context, cli *client.Client, cfg Config, contai
 	}
 	defer watcher.Close()
 
-	if err := watcher.Add(cfg.WatchDir); err != nil {
-		fmt.Printf("Error watching directory: %v\n", err)
-		return
-	}
+	// Add watchers recursively for all subdirectories.
+	filepath.Walk(cfg.WatchDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if err := watcher.Add(path); err != nil {
+				fmt.Printf("Error watching directory %s: %v\n", path, err)
+			}
+		}
+		return nil
+	})
+
 	fmt.Println("Watching for file changes in:", cfg.WatchDir)
-
-        filepath.Walk(cfg.WatchDir, func(path string, info os.FileInfo, err error) error {
-          if err != nil {
-            return err
-          }
-          if info.IsDir() {
-            if err := watcher.Add(path); err != nil {
-              fmt.Printf("Error watching directory %s: %v\n", path, err)
-            }
-          }
-          return nil
-        })
-
-	// Set debounce duration (e.g., 2 seconds)
 	debounceDuration := 2 * time.Second
 	var debounceTimer *time.Timer
 
@@ -216,9 +209,10 @@ func watchAndRestart(ctx context.Context, cli *client.Client, cfg Config, contai
 			if !ok {
 				return
 			}
+			// Look for write, create, or remove events.
 			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove) != 0 {
 				fmt.Println("File change detected:", event.Name)
-				// Reset the debounce timer on each event
+				// Restart the debounce timer on each event.
 				if debounceTimer != nil {
 					debounceTimer.Stop()
 				}
@@ -228,24 +222,21 @@ func watchAndRestart(ctx context.Context, cli *client.Client, cfg Config, contai
 			if debounceTimer != nil {
 				return debounceTimer.C
 			}
-			// If no timer is active, return a nil channel (blocks forever)
-			return make(chan time.Time)
+			// If no timer is active, block indefinitely.
+			ch := make(chan time.Time)
+			return ch
 		}():
-			// Timer fired: no further events for debounceDuration, so restart container.
 			fmt.Println("Restarting container due to file changes")
 			stopAndRemoveContainer(cli, *containerID)
-			newID, err := startContainer(ctx, cli, cfg, cmd, interactive)
+			newID, err := startContainer(ctx, cli, cfg)
 			if err != nil {
 				fmt.Printf("Error restarting container: %v\n", err)
 			} else {
 				*containerID = newID
-				if interactive {
-					if err := attachContainer(ctx, cli, newID, interactive); err != nil {
-						fmt.Printf("Error attaching to container: %v\n", err)
-					}
+				if err := attachContainer(ctx, cli, newID); err != nil {
+					fmt.Printf("Error attaching to container: %v\n", err)
 				}
 			}
-			// Clear the timer so we don’t accidentally restart again
 			debounceTimer = nil
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -258,91 +249,40 @@ func watchAndRestart(ctx context.Context, cli *client.Client, cfg Config, contai
 	}
 }
 
-// runServer is the Cobra command for the "server" subcommand.
-func runServer(cmd *cobra.Command, args []string) error {
+func main() {
 	cfg := getConfig()
 	ctx := context.Background()
+
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return fmt.Errorf("failed to create docker client: %w", err)
+		fmt.Printf("Error creating Docker client: %v\n", err)
+		os.Exit(1)
 	}
-	// Hugo server command: ensure it binds to 0.0.0.0.
-	serverCmd := []string{"server", "--bind", "0.0.0.0", "--disableFastRender", "--poll", "--liveReload"}
-	containerID, err := startContainer(ctx, cli, cfg, serverCmd, true)
+
+	// Start the Hugo container interactively.
+	containerID, err := startContainer(ctx, cli, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to start container: %w", err)
+		fmt.Printf("Error starting container: %v\n", err)
+		os.Exit(1)
 	}
-	if err := attachContainer(ctx, cli, containerID, true); err != nil {
-		return fmt.Errorf("failed to attach container: %w", err)
+
+	// Attach to the container.
+	if err := attachContainer(ctx, cli, containerID); err != nil {
+		fmt.Printf("Error attaching container: %v\n", err)
+		os.Exit(1)
 	}
-	// Handle CTRL+C to clean up.
+
+	// Setup signal handling (CTRL+C) to clean up.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		fmt.Println("\nReceived shutdown signal.")
+		fmt.Println("\nReceived shutdown signal. Stopping container.")
 		stopAndRemoveContainer(cli, containerID)
 		os.Exit(0)
 	}()
-	// Start file watcher to restart the container on file changes.
-	watchAndRestart(ctx, cli, cfg, &containerID, serverCmd, true)
-	return nil
-}
 
-// runNonInteractive runs the container once for non-interactive subcommands.
-func runNonInteractive(cmd *cobra.Command, args []string) error {
-	cfg := getConfig()
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		return fmt.Errorf("failed to create docker client: %w", err)
-	}
-	commandArgs := []string{cmd.Name()}
-	containerID, err := startContainer(ctx, cli, cfg, commandArgs, false)
-	if err != nil {
-		return fmt.Errorf("failed to start container: %w", err)
-	}
-	if err := attachContainer(ctx, cli, containerID, false); err != nil {
-		return fmt.Errorf("failed to attach container: %w", err)
-	}
-	statusCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return fmt.Errorf("container wait error: %w", err)
-		}
-	case <-statusCh:
-	}
-	return nil
-}
-
-func main() {
-	rootCmd := &cobra.Command{
-		Use:   "docker_run",
-		Short: "Run the Hugo application inside a Docker container",
-	}
-
-	// Server command with live file watching.
-	serverCmd := &cobra.Command{
-		Use:   "server",
-		Short: "Run Hugo server with live file watching",
-		RunE:  runServer,
-	}
-	rootCmd.AddCommand(serverCmd)
-
-	// Other non-interactive subcommands.
-	for _, sub := range []string{"shell", "build", "generate_toml", "update_scripts", "update_fdevsec"} {
-		subCmd := &cobra.Command{
-			Use:   sub,
-			Short: fmt.Sprintf("Run Hugo %s command", sub),
-			RunE:  runNonInteractive,
-		}
-		rootCmd.AddCommand(subCmd)
-	}
-
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Println("Error:", err)
-		os.Exit(1)
-	}
+	// Start the file watcher to monitor changes and restart the container when needed.
+	watchAndRestart(ctx, cli, cfg, &containerID)
 }
 

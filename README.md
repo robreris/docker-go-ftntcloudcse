@@ -1,13 +1,18 @@
 ## FortinetCloudCSE Docker Development Helper
 
-Prereqs:
+Prereqs for building binary:
 
 - Docker installed (via Rancher Desktop, for example)
-- Go installed 
+- Go installed (not needed if you just want to run the compiled binary)
   - For instructions on installing Go, head here: https://go.dev/doc/install
 - Workshop Docker image built
 
 ## To build the CLI tool:
+
+*Download necessary go libraries:*
+```
+go get -u
+```
 
 *Initialize the Go module:*
 ```
@@ -46,13 +51,23 @@ echo $PATH
 echo %PATH% // Windows
 ```
 
-## To Run, Build, or Get a Shell In the Container:
+## To Run:
+
+The binary will look for the following environment variables. If you don't set them in your current shell, defaults will be set as below:
+
+| Environment Variable | Default Setting      |
+| -------------------- | -------------------- |
+| DOCKER_IMAGE         | fortinet-hugo:latest |
+| HOST_PORT            | 1313                 |
+| CONTAINER_PORT       | 1313                 |
+| WATCH_DIR            | . (current directory)|
+
 
 *From your workshop directory, run:*
 
 ```
-docker_run server
+./docker_run
 
-docker_run build
+(or)
 
-docker_run shell
+C:\docker_run.exe
