@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+        "os/signal"
+        "syscall"
+        //"time"
 	"path/filepath"
 	"runtime"
 	"strings"
 
-	"github.com/docker/docker/api/types"
+	//"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
@@ -80,6 +83,9 @@ func runContainer(ctx context.Context, cli *client.Client, cfg Config, commandAr
 		AttachStderr: true,
 		AttachStdin:  interactive,
 		OpenStdin:    interactive,
+                ExposedPorts: nat.PortSet{
+                   nat.Port(cfg.ContainerPort + "/tcp"): struct{}{},
+                },
 	}
 
 	hostConfig := &container.HostConfig{
@@ -92,15 +98,43 @@ func runContainer(ctx context.Context, cli *client.Client, cfg Config, commandAr
 	if err != nil {
 		return fmt.Errorf("container create error: %w", err)
 	}
+        containerID := created.ID
+
+        // Capture CTRL+C (SIGINT/SIGTERM) to stop and remove the container
+        sigChan := make(chan os.Signal, 1)
+        signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+
+        go func() {
+            <-sigChan // Wait for a termination signal
+            fmt.Println("\nReceived shutdown signal, stopping container...")
+
+
+            // Stop the container gracefully
+            timeOut := 10
+            stopTimeout := container.StopOptions{Timeout: &timeOut}
+            if err := cli.ContainerStop(context.Background(), containerID, stopTimeout); err != nil {
+                fmt.Printf("Error stopping container: %v\n", err)
+            } 
+
+            // Remove the container
+            if err := cli.ContainerRemove(context.Background(), containerID, container.RemoveOptions{Force: true}); err != nil {
+                fmt.Printf("Error removing container: %v\n", err)
+            }
+
+
+            os.Exit(0) // Exit the Go program after cleanup
+        }()
+
 
 	// Start the container.
-	if err := cli.ContainerStart(ctx, created.ID, types.ContainerStartOptions{}); err != nil {
+	if err := cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("container start error: %w", err)
 	}
 
 	// If interactive, attach to the container's I/O.
 	if interactive {
-		attachResp, err := cli.ContainerAttach(ctx, created.ID, types.ContainerAttachOptions{
+		attachResp, err := cli.ContainerAttach(ctx, created.ID, container.AttachOptions{
 			Stream: true, Stdout: true, Stderr: true, Stdin: true,
 		})
 		if err != nil {
@@ -120,7 +154,7 @@ func runContainer(ctx context.Context, cli *client.Client, cfg Config, commandAr
 		}
 	} else {
 		// For non-interactive commands, stream logs.
-		logs, err := cli.ContainerLogs(ctx, created.ID, types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true, Follow: true})
+		logs, err := cli.ContainerLogs(ctx, created.ID, container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true})
 		if err != nil {
 			return fmt.Errorf("container logs error: %w", err)
 		}
@@ -198,6 +232,8 @@ func runHugoCommand(mainCmd string) error {
 		}
 	}
 
+        fmt.Printf("Port Bindings: %+v\n", portBindings)
+    
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
