@@ -59,18 +59,18 @@ func getConfig() Config {
 }
 
 // adjustPathForDocker converts paths for Windows/WSL2; on macOS (darwin) no change is needed.
-func adjustPathForDocker(path string) string {
-	if runtime.GOOS == "darwin" {
+func adjustPathForDockerWithOS(path, goos string, isWSL bool) string {
+	if goos == "darwin" {
 		// macOS uses Unix-style paths.
 		return path
-	} else if runtime.GOOS == "windows" {
+	} else if goos == "windows" {
 		// Convert Unix-like paths (/mnt/c/...) to Windows-style (C:\...)
 		if strings.HasPrefix(path, "/mnt/") {
 			path = strings.ReplaceAll(path, "/mnt/", "")
 			path = strings.ReplaceAll(path, "/", "\\")
 			path = strings.ToUpper(path[:1]) + ":" + path[1:]
 		}
-	} else if isWSL2() {
+	} else if isWSL {
 		// Convert Windows-style paths (C:\...) to WSL-compatible paths (/mnt/c/...)
 		if len(path) > 1 && path[1] == ':' {
 			drive := strings.ToLower(string(path[0]))
@@ -78,6 +78,10 @@ func adjustPathForDocker(path string) string {
 		}
 	}
 	return path
+}
+
+func adjustPathForDocker(path string) string {
+  return adjustPathForDockerWithOS(path, runtime.GOOS, isWSL2())
 }
 
 func isWSL2() bool {

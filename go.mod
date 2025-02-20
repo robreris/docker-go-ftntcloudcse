@@ -3,7 +3,7 @@ module docker-run-helper
 go 1.23.4
 
 require (
-	github.com/docker/docker v27.5.1+incompatible
+	github.com/docker/docker v28.0.0+incompatible
 	github.com/docker/go-connections v0.5.0
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/spf13/cobra v1.9.1
