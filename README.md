@@ -20,15 +20,21 @@ go mod init docker-run-helper
 ```
 
 *Build:*
-- **Linux:**
+
+**Note: Before building, you can confirm availability of the desired OS/Architecture via:**
+```
+go tool dist list
+``` 
+
+- **Linux/x86_64:**
 ```
 GOOS=linux GOARCH=amd64 go build -o docker_run .
 ```
-- **macOS:**
+- **macOS/AMD64:**
 ```
 GOOS=darwin GOARCH=amd64 go build -o docker_run .
 ```
-- **Windows:**
+- **Windows/x86_64:**
 ```
 GOOS=windows GOARCH=amd64 go build -o docker_run.exe .
 
