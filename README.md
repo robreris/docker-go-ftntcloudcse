@@ -2,11 +2,21 @@
 
 ## To run the tool via pre-compiled binary:
 
-Navigate to the *binaries* folder above, click the binary for your OS/Architecture, and click on the **download raw file*** icon at the top right of the screen. 
+Navigate to the *binaries* folder above, click the binary for your OS/Architecture, and click on the **download raw file** icon at the top right of the screen. 
 
 Then, you can either copy the binary into your system path or to the local directory containing your workshop.
 
-To get you your system path, 
+To get your system path:
+
+- In bash (linux or mac):
+```
+echo $PATH 
+```
+
+- In windows:
+```
+echo %PATH% // Windows
+```
 
 The binary will look for the following environment variables. If you don't set them in your current shell, defaults will be set as below:
 
