@@ -15,7 +15,7 @@ echo $PATH
 
 - In windows:
 ```
-echo %PATH% // Windows
+echo %PATH%
 ```
 
 The binary will look for the following environment variables. If you don't set them in your current shell, defaults will be set as below:
@@ -31,14 +31,17 @@ The binary will look for the following environment variables. If you don't set t
 *From your workshop directory, run:*
 
 ```
-./docker_run
+mv docker-run-go-<OS>-<arch> docker-run-go
+./docker-run-go
 
 (or)
 
-C:\docker_run.exe
+C:\move docker-run-go-windows-<arch>.exe docker-run-go.exe
+C:\docker-run-go.exe
+```
 
 
-## To build the CLI tool:
+## To *build* the CLI tool:
 
 **Prereqs**:
 
@@ -49,12 +52,7 @@ C:\docker_run.exe
 
 *Download necessary go libraries:*
 ```
-go get -u
-```
-
-*Initialize the Go module:*
-```
-go mod init docker-run-helper
+go mod download
 ```
 
 *Build:*
@@ -92,5 +90,5 @@ echo $PATH
 
 - In windows:
 ```
-echo %PATH% // Windows
+echo %PATH%
 ```
